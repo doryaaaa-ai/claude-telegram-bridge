@@ -1,0 +1,17 @@
+[Unit]
+Description=CodeChan Telegram Bot - Autonomous AI Worker
+After=network.target
+
+[Service]
+Type=simple
+User=aimiral
+WorkingDirectory=/home/aimiral
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/home/aimiral/.npm-global/bin:/home/aimiral/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HOME=/home/aimiral
+ExecStart=/home/aimiral/.local/bin/uv run --project /home/aimiral/claude-telegram-bridge python /home/aimiral/claude-telegram-bridge/telegram_bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

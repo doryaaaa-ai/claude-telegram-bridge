@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-コードちゃん自律ワーカー v2
+コードちゃん自律ワーカー v3
 - Telegram経由でれじぇんどりゃーから指示を受ける
-- claude CLIで自律的に作業する
+- claude CLI --continue で会話の文脈を維持
 - 承認が必要な時はTelegramで聞いて返事を待つ
+- GitHub issueを定期巡回して自動で作業
 - systemdで常駐、VM再起動しても復活
 """
 
@@ -12,6 +13,7 @@ import json
 import os
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 import httpx
@@ -20,8 +22,25 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8756603336:AAFNDjiXt3BCwjk_BWu
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5458366490")
 STATE_FILE = Path.home() / ".claude" / "telegram-bot-state.json"
 APPROVAL_DIR = Path.home() / ".claude" / "approvals"
+CLAUDE_PATH = "/home/aimiral/.npm-global/bin/claude"
 
 MAX_MSG_LEN = 4000
+
+PROJECTS = {
+    "ai-phone": {
+        "dir": "/home/aimiral/ai-phone",
+        "repo": "doryaaaa-ai/ai-phone",
+        "desc": "AI電話サービス",
+    },
+    "menucraft": {
+        "dir": "/home/aimiral/menucraft",
+        "repo": "doryaaaa-ai/menucraft",
+        "desc": "LINE連携レストラン管理",
+    },
+}
+
+# Issue巡回間隔（秒）
+ISSUE_CHECK_INTERVAL = 300  # 5分
 
 
 # ========== State Management ==========
@@ -32,20 +51,27 @@ def load_state() -> dict:
             return json.loads(STATE_FILE.read_text())
         except Exception:
             pass
-    return {"last_update_id": 0, "conversation": [], "active_task": None}
+    return {
+        "last_update_id": 0,
+        "conversation": [],
+        "active_task": None,
+        "session_ids": {},       # project -> session_id (会話継続用)
+        "processed_issues": [],  # 処理済みissue番号
+    }
 
 
 def save_state(state: dict):
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     if len(state.get("conversation", [])) > 40:
         state["conversation"] = state["conversation"][-40:]
+    if len(state.get("processed_issues", [])) > 200:
+        state["processed_issues"] = state["processed_issues"][-200:]
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2))
 
 
 # ========== Approval System ==========
 
 def check_pending_approvals() -> list[dict]:
-    """Check for approval requests from Claude tasks."""
     APPROVAL_DIR.mkdir(parents=True, exist_ok=True)
     pending = []
     for f in APPROVAL_DIR.glob("request_*.json"):
@@ -59,7 +85,6 @@ def check_pending_approvals() -> list[dict]:
 
 
 def respond_to_approval(approval_id: str, approved: bool, message: str = ""):
-    """Write approval response for Claude task to pick up."""
     resp_file = APPROVAL_DIR / f"response_{approval_id}.json"
     resp_file.write_text(json.dumps({
         "approval_id": approval_id,
@@ -68,7 +93,6 @@ def respond_to_approval(approval_id: str, approved: bool, message: str = ""):
         "responded_at": time.time(),
     }, ensure_ascii=False))
 
-    # Mark request as responded
     req_file = APPROVAL_DIR / f"request_{approval_id}.json"
     if req_file.exists():
         data = json.loads(req_file.read_text())
@@ -76,10 +100,22 @@ def respond_to_approval(approval_id: str, approved: bool, message: str = ""):
         req_file.write_text(json.dumps(data, ensure_ascii=False))
 
 
+def cleanup_old_approvals():
+    """24時間以上前の承認ファイルを削除"""
+    APPROVAL_DIR.mkdir(parents=True, exist_ok=True)
+    cutoff = time.time() - 86400
+    for f in APPROVAL_DIR.glob("*.json"):
+        try:
+            data = json.loads(f.read_text())
+            if data.get("created_at", data.get("responded_at", 0)) < cutoff:
+                f.unlink()
+        except Exception:
+            pass
+
+
 # ========== Telegram Helpers ==========
 
 async def send_message(client: httpx.AsyncClient, text: str, reply_to: int | None = None) -> int | None:
-    """Send message to Telegram. Returns message_id."""
     chunks = []
     while len(text) > MAX_MSG_LEN:
         split_at = text.rfind("\n", 0, MAX_MSG_LEN)
@@ -96,29 +132,47 @@ async def send_message(client: httpx.AsyncClient, text: str, reply_to: int | Non
         payload = {"chat_id": CHAT_ID, "text": chunk}
         if reply_to:
             payload["reply_to_message_id"] = reply_to
-        resp = await client.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json=payload,
-            timeout=30,
-        )
-        data = resp.json()
-        if data.get("ok"):
-            last_msg_id = data["result"]["message_id"]
+        try:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json=payload,
+                timeout=30,
+            )
+            data = resp.json()
+            if data.get("ok"):
+                last_msg_id = data["result"]["message_id"]
+        except Exception as e:
+            print(f"Send error: {e}")
     return last_msg_id
 
 
 async def send_typing(client: httpx.AsyncClient):
-    await client.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendChatAction",
-        json={"chat_id": CHAT_ID, "action": "typing"},
-        timeout=10,
-    )
+    try:
+        await client.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendChatAction",
+            json={"chat_id": CHAT_ID, "action": "typing"},
+            timeout=10,
+        )
+    except Exception:
+        pass
 
 
 # ========== Claude Execution ==========
 
-def build_claude_prompt(message: str) -> str:
-    """Build prompt with approval system instructions."""
+def detect_project(text: str) -> str | None:
+    """テキストからプロジェクトを判定"""
+    text_lower = text.lower()
+    for name in PROJECTS:
+        if name in text_lower or name.replace("-", " ") in text_lower:
+            return name
+    return None
+
+
+def run_claude(message: str, state: dict, project: str | None = None, continue_session: bool = True) -> str:
+    """Run claude CLI with conversation continuity."""
+    work_dir = PROJECTS[project]["dir"] if project and project in PROJECTS else "/home/aimiral"
+
+    # 承認システムの説明をプロンプトに追加
     approval_instructions = f"""
 承認が必要な操作（デプロイ、課金、破壊的変更、重要な設計判断）がある場合は、
 以下のJSONファイルを作成して承認を待ってください：
@@ -136,15 +190,26 @@ def build_claude_prompt(message: str) -> str:
 ファイル作成後、{APPROVAL_DIR}/response_<timestamp>.json が作られるまで
 数秒おきにチェックしてください。response の approved フィールドで判断を確認できます。
 """
-    return f"{message}\n\n{approval_instructions}"
+    prompt = f"{message}\n\n{approval_instructions}"
 
+    # セッションID管理（プロジェクトごとに会話継続）
+    session_key = project or "_default"
+    cmd = [CLAUDE_PATH, "-p", "--allowedTools", "*"]
 
-def run_claude(message: str, work_dir: str = "/home/aimiral") -> str:
-    """Run claude CLI with the message."""
-    prompt = build_claude_prompt(message)
+    if continue_session and session_key in state.get("session_ids", {}):
+        # 前回のセッションを継続
+        cmd.extend(["--resume", state["session_ids"][session_key]])
+    else:
+        # 新しいセッション
+        session_id = str(uuid.uuid4())
+        state.setdefault("session_ids", {})[session_key] = session_id
+        cmd.extend(["--session-id", session_id])
+
+    cmd.append(prompt)
+
     try:
         result = subprocess.run(
-            ["claude", "-p", "--allowedTools", "*", prompt],
+            cmd,
             capture_output=True,
             text=True,
             timeout=600,
@@ -156,6 +221,12 @@ def run_claude(message: str, work_dir: str = "/home/aimiral") -> str:
         )
         output = result.stdout.strip()
         if not output and result.stderr.strip():
+            # セッション復帰失敗時は新しいセッションで再試行
+            if "session" in result.stderr.lower() or "resume" in result.stderr.lower():
+                print(f"Session resume failed, starting new session")
+                if session_key in state.get("session_ids", {}):
+                    del state["session_ids"][session_key]
+                return run_claude(message, state, project, continue_session=False)
             output = f"[stderr] {result.stderr.strip()}"
         return output or "[空の応答]"
     except subprocess.TimeoutExpired:
@@ -166,34 +237,85 @@ def run_claude(message: str, work_dir: str = "/home/aimiral") -> str:
         return f"[エラー: {e}]"
 
 
+# ========== GitHub Issue巡回 ==========
+
+def fetch_issues(repo: str) -> list[dict]:
+    """GitHub issueを取得"""
+    try:
+        result = subprocess.run(
+            ["gh", "issue", "list", "--repo", repo, "--json", "number,title,labels,assignees,body", "--limit", "10"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={
+                **os.environ,
+                "PATH": f"/home/aimiral/.npm-global/bin:/home/aimiral/.local/bin:{os.environ.get('PATH', '')}",
+            },
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return json.loads(result.stdout)
+    except Exception as e:
+        print(f"Issue fetch error: {e}")
+    return []
+
+
+def find_auto_issues(state: dict) -> list[dict]:
+    """自動処理すべきissueを探す（'codechan' or 'auto' ラベル付き）"""
+    auto_issues = []
+    processed = set(state.get("processed_issues", []))
+
+    for project_name, project_info in PROJECTS.items():
+        issues = fetch_issues(project_info["repo"])
+        for issue in issues:
+            issue_key = f"{project_name}#{issue['number']}"
+            if issue_key in processed:
+                continue
+
+            labels = [l.get("name", "").lower() for l in issue.get("labels", [])]
+            # 'codechan' or 'auto' ラベルが付いてるissueを自動処理
+            if any(l in ("codechan", "auto", "コードちゃん") for l in labels):
+                auto_issues.append({
+                    "project": project_name,
+                    "issue": issue,
+                    "key": issue_key,
+                })
+
+    return auto_issues
+
+
 # ========== Main Loop ==========
 
 async def main():
-    print("=== コードちゃん自律ワーカー v2 起動 ===")
+    print("=== コードちゃん自律ワーカー v3 起動 ===")
     print(f"Chat ID: {CHAT_ID}")
     print(f"Approval Dir: {APPROVAL_DIR}")
+    print(f"Issue Check Interval: {ISSUE_CHECK_INTERVAL}s")
     print("メッセージ待機中...")
 
     APPROVAL_DIR.mkdir(parents=True, exist_ok=True)
     state = load_state()
     offset = state["last_update_id"]
-    pending_approval_msg_ids: dict[str, int] = {}  # approval_id -> telegram msg_id
+    pending_approval_msg_ids: dict[str, int] = {}
 
     async with httpx.AsyncClient() as client:
         await send_message(
             client,
-            "コードちゃん起動したで！🙌\n"
-            "Telegramから指示してな。承認が必要な時はここで聞くで。\n\n"
+            "コードちゃん v3 起動したで！🙌\n\n"
+            "✅ 会話の文脈を覚えるようになった\n"
+            "✅ GitHub issueを自動巡回するようになった\n"
+            "  （'codechan'ラベルのissueを自動処理）\n"
+            "✅ 承認が必要な時はここで聞くで\n\n"
             "コマンド:\n"
             "/ping - 生存確認\n"
             "/status - VM状態\n"
             "/projects - プロジェクト一覧\n"
-            "/tasks - 実行中タスク確認"
+            "/tasks - タスク確認\n"
+            "/issues - GitHub issue確認\n"
+            "/reset - 会話リセット"
         )
 
-        # Background: approval checker
+        # ----- Background: 承認チェッカー -----
         async def check_approvals_loop():
-            """定期的に承認リクエストをチェックしてTelegramに送る"""
             notified: set[str] = set()
             while True:
                 try:
@@ -212,11 +334,63 @@ async def main():
                             if msg_id:
                                 pending_approval_msg_ids[aid] = msg_id
                             notified.add(aid)
+                    # 古い承認ファイル掃除
+                    cleanup_old_approvals()
                 except Exception as e:
                     print(f"Approval check error: {e}")
                 await asyncio.sleep(3)
 
+        # ----- Background: Issue巡回 -----
+        async def issue_patrol_loop():
+            while True:
+                try:
+                    auto_issues = await asyncio.get_event_loop().run_in_executor(None, find_auto_issues, state)
+                    for item in auto_issues:
+                        project = item["project"]
+                        issue = item["issue"]
+                        issue_key = item["key"]
+
+                        # Telegramに通知
+                        await send_message(
+                            client,
+                            f"🔍 Issue発見！自動作業開始するで\n\n"
+                            f"プロジェクト: {project}\n"
+                            f"#{issue['number']}: {issue['title']}\n"
+                            f"{issue.get('body', '')[:300]}"
+                        )
+
+                        # Claude実行
+                        await send_typing(client)
+                        task_msg = (
+                            f"GitHub Issue #{issue['number']}: {issue['title']}\n\n"
+                            f"{issue.get('body', '')}\n\n"
+                            f"このissueを実装してください。完了したらgit commit & pushして、"
+                            f"gh issue close {issue['number']} でissueを閉じてください。"
+                        )
+
+                        state["active_task"] = f"[{project}] #{issue['number']}: {issue['title']}"
+                        save_state(state)
+
+                        loop = asyncio.get_event_loop()
+                        response = await loop.run_in_executor(None, run_claude, task_msg, state, project)
+
+                        await send_message(
+                            client,
+                            f"📋 Issue #{issue['number']} 作業完了\n\n{response}"
+                        )
+
+                        # 処理済みに追加
+                        state["processed_issues"].append(issue_key)
+                        state["active_task"] = None
+                        save_state(state)
+
+                except Exception as e:
+                    print(f"Issue patrol error: {e}")
+
+                await asyncio.sleep(ISSUE_CHECK_INTERVAL)
+
         approval_task = asyncio.create_task(check_approvals_loop())
+        issue_task = asyncio.create_task(issue_patrol_loop())
 
         while True:
             try:
@@ -250,17 +424,19 @@ async def main():
                     if not text:
                         continue
 
-                    # ----- 承認への返事チェック -----
+                    # ----- 承認への返事 -----
                     reply_to = msg.get("reply_to_message", {}).get("message_id")
                     if reply_to:
-                        # 承認リクエストへの返信か確認
                         for aid, tmsg_id in list(pending_approval_msg_ids.items()):
                             if reply_to == tmsg_id:
                                 text_lower = text.lower().strip()
-                                approved = text_lower in ("ok", "おk", "ок", "承認", "yes", "ええよ", "おけ", "いいよ", "👍", "はい")
+                                approved = text_lower in (
+                                    "ok", "おk", "承認", "yes", "ええよ", "おけ",
+                                    "いいよ", "👍", "はい", "ええで", "おっけー", "go",
+                                )
                                 respond_to_approval(aid, approved, text)
-                                status = "✅ 承認" if approved else "❌ 却下"
-                                await send_message(client, f"{status}したで！(ID: {aid})", msg_id)
+                                status_emoji = "✅ 承認" if approved else "❌ 却下"
+                                await send_message(client, f"{status_emoji}したで！", msg_id)
                                 del pending_approval_msg_ids[aid]
                                 break
                         continue
@@ -276,61 +452,68 @@ async def main():
                         proc = subprocess.run(["uptime"], capture_output=True, text=True)
                         disk = subprocess.run(["df", "-h", "/"], capture_output=True, text=True)
                         mem = subprocess.run(["free", "-h"], capture_output=True, text=True)
-                        status_text = (
-                            f"Uptime: {proc.stdout.strip()}\n\n"
-                            f"Disk:\n{disk.stdout.strip()}\n\n"
-                            f"Memory:\n{mem.stdout.strip()}"
-                        )
-                        await send_message(client, status_text, msg_id)
-                        continue
-                    elif text == "/projects":
                         await send_message(
                             client,
-                            "📱 ai-phone - AI電話サービス（未着手）\n"
-                            "🍽️ menucraft - LINE連携レストラン管理（未着手）",
+                            f"Uptime: {proc.stdout.strip()}\n\n"
+                            f"Disk:\n{disk.stdout.strip()}\n\n"
+                            f"Memory:\n{mem.stdout.strip()}",
                             msg_id,
                         )
                         continue
+                    elif text == "/projects":
+                        proj_list = "\n".join(
+                            f"{'📱' if n == 'ai-phone' else '🍽️'} {n} - {p['desc']}"
+                            for n, p in PROJECTS.items()
+                        )
+                        await send_message(client, proj_list, msg_id)
+                        continue
                     elif text == "/tasks":
                         pending = check_pending_approvals()
+                        lines = []
                         if pending:
-                            tasks = "\n".join(
-                                f"- {p.get('question', '?')} (ID: {p['approval_id']})"
-                                for p in pending
-                            )
-                            await send_message(client, f"承認待ちタスク:\n{tasks}", msg_id)
+                            lines.append("⚠️ 承認待ち:")
+                            for p in pending:
+                                lines.append(f"  - {p.get('question', '?')}")
+                        active = state.get("active_task")
+                        if active:
+                            lines.append(f"\n🔨 実行中: {active}")
+                        if not lines:
+                            lines.append("タスクなし。指示待ちやで！")
+                        await send_message(client, "\n".join(lines), msg_id)
+                        continue
+                    elif text == "/issues":
+                        all_issues = []
+                        for pname, pinfo in PROJECTS.items():
+                            issues = fetch_issues(pinfo["repo"])
+                            for iss in issues:
+                                all_issues.append(f"[{pname}] #{iss['number']}: {iss['title']}")
+                        if all_issues:
+                            await send_message(client, "GitHub Issues:\n" + "\n".join(all_issues), msg_id)
                         else:
-                            active = state.get("active_task")
-                            if active:
-                                await send_message(client, f"実行中: {active}", msg_id)
-                            else:
-                                await send_message(client, "タスクなし。指示待ちやで！", msg_id)
+                            await send_message(client, "Issueなし！", msg_id)
+                        continue
+                    elif text == "/reset":
+                        state["session_ids"] = {}
+                        save_state(state)
+                        await send_message(client, "会話リセットしたで！新しい文脈で始めるわ。", msg_id)
                         continue
 
                     # ----- 通常メッセージ → Claude実行 -----
                     print(f"\n📩 受信: {text[:100]}...")
+                    project = detect_project(text)
                     state["active_task"] = text[:100]
                     save_state(state)
 
-                    await send_message(client, "🔨 了解、作業開始するで...", msg_id)
+                    proj_label = f" [{project}]" if project else ""
+                    await send_message(client, f"🔨 了解{proj_label}、作業開始するで...", msg_id)
                     await send_typing(client)
 
-                    # 作業ディレクトリ判定
-                    work_dir = "/home/aimiral"
-                    text_lower = text.lower()
-                    if "ai-phone" in text_lower or "ai phone" in text_lower:
-                        work_dir = "/home/aimiral/ai-phone"
-                    elif "menucraft" in text_lower:
-                        work_dir = "/home/aimiral/menucraft"
-
-                    # Claude実行（別スレッドで）
                     loop = asyncio.get_event_loop()
-                    response = await loop.run_in_executor(None, run_claude, text, work_dir)
+                    response = await loop.run_in_executor(None, run_claude, text, state, project)
 
                     print(f"📤 完了: {response[:100]}...")
                     await send_message(client, response, msg_id)
 
-                    # タスク完了
                     state["active_task"] = None
                     state["conversation"].append({"role": "user", "text": text})
                     state["conversation"].append({"role": "assistant", "text": response[:500]})
@@ -341,6 +524,7 @@ async def main():
             except KeyboardInterrupt:
                 print("\n終了！")
                 approval_task.cancel()
+                issue_task.cancel()
                 await send_message(client, "コードちゃん落ちるで！またな！")
                 break
             except Exception as e:

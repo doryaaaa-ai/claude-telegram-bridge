@@ -27,17 +27,21 @@ CLAUDE_PATH = "/home/aimiral/.npm-global/bin/claude"
 MAX_MSG_LEN = 4000
 
 PROJECTS = {
-    "ai-phone": {
-        "dir": "/home/aimiral/ai-phone",
-        "repo": "doryaaaa-ai/ai-phone",
-        "desc": "AI電話サービス",
+    "dexs-restaurant": {
+        "dir": "/home/aimiral/AiMiraiLabs",
+        "repo": "doryaaaa-ai/AiMiraiLabs",
+        "desc": "DEXS飲食店向けDXシステム",
     },
-    "menucraft": {
-        "dir": "/home/aimiral/menucraft",
-        "repo": "doryaaaa-ai/menucraft",
-        "desc": "LINE連携レストラン管理",
+    "dexs-business": {
+        "dir": "/home/aimiral/AiMiraiLabs",
+        "repo": "doryaaaa-ai/AiMiraiLabs",
+        "desc": "DEXS企業向けDXシステム",
     },
 }
+
+# メインリポジトリ（issue巡回用）
+MAIN_REPO = "doryaaaa-ai/AiMiraiLabs"
+MAIN_DIR = "/home/aimiral/AiMiraiLabs"
 
 # Issue巡回間隔（秒）
 ISSUE_CHECK_INTERVAL = 300  # 5分
@@ -170,7 +174,7 @@ def detect_project(text: str) -> str | None:
 
 def run_claude(message: str, state: dict, project: str | None = None, continue_session: bool = True) -> str:
     """Run claude CLI with conversation continuity."""
-    work_dir = PROJECTS[project]["dir"] if project and project in PROJECTS else "/home/aimiral"
+    work_dir = PROJECTS[project]["dir"] if project and project in PROJECTS else MAIN_DIR
 
     # 承認システムの説明をプロンプトに追加
     approval_instructions = f"""
@@ -270,21 +274,21 @@ def find_auto_issues(state: dict) -> list[dict]:
     auto_issues = []
     processed = set(state.get("processed_issues", []))
 
-    for project_name, project_info in PROJECTS.items():
-        issues = fetch_issues(project_info["repo"])
-        for issue in issues:
-            issue_key = f"{project_name}#{issue['number']}"
-            if issue_key in processed:
-                continue
+    # メインリポジトリからissueを取得
+    issues = fetch_issues(MAIN_REPO)
+    for issue in issues:
+        issue_key = f"main#{issue['number']}"
+        if issue_key in processed:
+            continue
 
-            labels = [l.get("name", "").lower() for l in issue.get("labels", [])]
-            # 'codechan' or 'auto' ラベルが付いてるissueを自動処理
-            if any(l in ("codechan", "auto", "コードちゃん") for l in labels):
-                auto_issues.append({
-                    "project": project_name,
-                    "issue": issue,
-                    "key": issue_key,
-                })
+        labels = [l.get("name", "").lower() for l in issue.get("labels", [])]
+        # 'codechan' or 'auto' ラベルが付いてるissueを自動処理
+        if any(l in ("codechan", "auto", "コードちゃん") for l in labels):
+            auto_issues.append({
+                "project": None,  # メインリポジトリ直接
+                "issue": issue,
+                "key": issue_key,
+            })
 
     return auto_issues
 
@@ -370,11 +374,15 @@ async def main():
                         task_msg = (
                             f"GitHub Issue #{issue['number']}: {issue['title']}\n\n"
                             f"{issue.get('body', '')}\n\n"
-                            f"このissueを実装してください。完了したらgit commit & pushして、"
-                            f"gh issue close {issue['number']} でissueを閉じてください。"
+                            f"このissueを調査・実装してください。\n"
+                            f"調査系issueの場合は結果をissueにコメントしてから閉じてください：\n"
+                            f"gh issue comment {issue['number']} --repo {MAIN_REPO} --body '調査結果'\n"
+                            f"gh issue close {issue['number']} --repo {MAIN_REPO}\n"
+                            f"実装系issueの場合はgit commit & pushしてからissueを閉じてください。"
                         )
 
-                        state["active_task"] = f"[{project}] #{issue['number']}: {issue['title']}"
+                        project_name = project or "AiMiraiLabs"
+                        state["active_task"] = f"[{project_name}] #{issue['number']}: {issue['title']}"
                         save_state(state)
 
                         loop = asyncio.get_event_loop()
@@ -398,8 +406,30 @@ async def main():
         approval_task = asyncio.create_task(check_approvals_loop())
         issue_task = asyncio.create_task(issue_patrol_loop())
 
+        # Claude実行中のタスクを管理（メインループをブロックしない）
+        active_claude_tasks: list[asyncio.Task] = []
+
+        async def run_claude_task(text: str, project: str | None, msg_id: int):
+            """Claude実行をバックグラウンドで行い、完了後にTelegramへ返信"""
+            try:
+                loop = asyncio.get_event_loop()
+                response = await loop.run_in_executor(None, run_claude, text, state, project)
+                print(f"📤 完了: {response[:100]}...")
+                await send_message(client, response, msg_id)
+                state["active_task"] = None
+                state.setdefault("conversation", []).append({"role": "user", "text": text})
+                state["conversation"].append({"role": "assistant", "text": response[:500]})
+                save_state(state)
+            except Exception as e:
+                await send_message(client, f"[エラー: {e}]", msg_id)
+                state["active_task"] = None
+                save_state(state)
+
         while True:
             try:
+                # 完了したタスクを掃除
+                active_claude_tasks = [t for t in active_claude_tasks if not t.done()]
+
                 resp = await client.get(
                     f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
                     params={
@@ -431,6 +461,7 @@ async def main():
                         continue
 
                     # ----- 承認への返事 -----
+                    # reply_toでの承認マッチ
                     reply_to = msg.get("reply_to_message", {}).get("message_id")
                     if reply_to:
                         for aid, tmsg_id in list(pending_approval_msg_ids.items()):
@@ -445,6 +476,24 @@ async def main():
                                 await send_message(client, f"{status_emoji}したで！", msg_id)
                                 del pending_approval_msg_ids[aid]
                                 break
+                        continue
+
+                    # 短い承認ワードで、pending承認がある場合は直接処理
+                    text_lower = text.lower().strip()
+                    approval_words = (
+                        "ok", "おk", "承認", "yes", "ええよ", "おけ",
+                        "いいよ", "はい", "ええで", "おっけー", "go",
+                    )
+                    reject_words = ("ng", "却下", "no", "あかん", "だめ", "ダメ")
+                    pending = check_pending_approvals()
+                    if pending and text_lower in approval_words + reject_words:
+                        approved = text_lower in approval_words
+                        for req in pending:
+                            aid = req["approval_id"]
+                            respond_to_approval(aid, approved, text)
+                        status_emoji = "✅ 承認" if approved else "❌ 却下"
+                        count = len(pending)
+                        await send_message(client, f"{status_emoji} {count}件の承認を処理したで！", msg_id)
                         continue
 
                     # ----- コマンド処理 -----
@@ -468,7 +517,7 @@ async def main():
                         continue
                     elif text == "/projects":
                         proj_list = "\n".join(
-                            f"{'📱' if n == 'ai-phone' else '🍽️'} {n} - {p['desc']}"
+                            f"{'🍽️' if 'restaurant' in n else '🏢'} {n} - {p['desc']}"
                             for n, p in PROJECTS.items()
                         )
                         await send_message(client, proj_list, msg_id)
@@ -489,12 +538,13 @@ async def main():
                         continue
                     elif text == "/issues":
                         all_issues = []
-                        for pname, pinfo in PROJECTS.items():
-                            issues = fetch_issues(pinfo["repo"])
-                            for iss in issues:
-                                all_issues.append(f"[{pname}] #{iss['number']}: {iss['title']}")
+                        issues = fetch_issues(MAIN_REPO)
+                        for iss in issues:
+                            labels = ", ".join(l.get("name", "") for l in iss.get("labels", []))
+                            label_str = f" [{labels}]" if labels else ""
+                            all_issues.append(f"#{iss['number']}: {iss['title']}{label_str}")
                         if all_issues:
-                            await send_message(client, "GitHub Issues:\n" + "\n".join(all_issues), msg_id)
+                            await send_message(client, f"GitHub Issues ({MAIN_REPO}):\n" + "\n".join(all_issues), msg_id)
                         else:
                             await send_message(client, "Issueなし！", msg_id)
                         continue
@@ -504,7 +554,7 @@ async def main():
                         await send_message(client, "会話リセットしたで！新しい文脈で始めるわ。", msg_id)
                         continue
 
-                    # ----- 通常メッセージ → Claude実行 -----
+                    # ----- 通常メッセージ → Claude実行（ノンブロッキング） -----
                     print(f"\n📩 受信: {text[:100]}...")
                     project = detect_project(text)
                     state["active_task"] = text[:100]
@@ -514,16 +564,9 @@ async def main():
                     await send_message(client, f"🔨 了解{proj_label}、作業開始するで...", msg_id)
                     await send_typing(client)
 
-                    loop = asyncio.get_event_loop()
-                    response = await loop.run_in_executor(None, run_claude, text, state, project)
-
-                    print(f"📤 完了: {response[:100]}...")
-                    await send_message(client, response, msg_id)
-
-                    state["active_task"] = None
-                    state.setdefault("conversation", []).append({"role": "user", "text": text})
-                    state["conversation"].append({"role": "assistant", "text": response[:500]})
-                    save_state(state)
+                    # バックグラウンドで実行（メインループは止まらん）
+                    task = asyncio.create_task(run_claude_task(text, project, msg_id))
+                    active_claude_tasks.append(task)
 
             except httpx.TimeoutException:
                 continue
@@ -531,6 +574,8 @@ async def main():
                 print("\n終了！")
                 approval_task.cancel()
                 issue_task.cancel()
+                for t in active_claude_tasks:
+                    t.cancel()
                 await send_message(client, "コードちゃん落ちるで！またな！")
                 break
             except Exception as e:

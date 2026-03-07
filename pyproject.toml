@@ -1,0 +1,20 @@
+[project]
+name = "claude-telegram-bridge"
+version = "0.1.0"
+description = "MCP server bridging Claude Code to Telegram for async communication"
+readme = "README.md"
+authors = [
+    { name = "AiMirai Labs", email = "aimirailabs@outlook.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28.1",
+    "mcp>=1.26.0",
+]
+
+[project.scripts]
+claude-telegram-bridge = "claude_telegram_bridge.server:main"
+
+[build-system]
+requires = ["uv_build>=0.10.9,<0.11.0"]
+build-backend = "uv_build"

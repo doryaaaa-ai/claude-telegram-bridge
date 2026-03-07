@@ -194,7 +194,7 @@ def run_claude(message: str, state: dict, project: str | None = None, continue_s
 
     # セッションID管理（プロジェクトごとに会話継続）
     session_key = project or "_default"
-    cmd = [CLAUDE_PATH, "-p", "--allowedTools", "*"]
+    cmd = [CLAUDE_PATH, "-p"]
 
     if continue_session and session_key in state.get("session_ids", {}):
         # 前回のセッションを継続
@@ -205,19 +205,25 @@ def run_claude(message: str, state: dict, project: str | None = None, continue_s
         state.setdefault("session_ids", {})[session_key] = session_id
         cmd.extend(["--session-id", session_id])
 
-    cmd.append(prompt)
+    # プロンプトは stdin で渡す
+    env = {
+        **os.environ,
+        "PATH": f"/home/aimiral/.npm-global/bin:/home/aimiral/.local/bin:/usr/local/bin:/usr/bin:/bin",
+        "HOME": "/home/aimiral",
+    }
+    # ネスト防止の環境変数を除去
+    env.pop("CLAUDECODE", None)
+    env.pop("CLAUDE_CODE", None)
 
     try:
         result = subprocess.run(
             cmd,
+            input=prompt,
             capture_output=True,
             text=True,
             timeout=600,
             cwd=work_dir,
-            env={
-                **os.environ,
-                "PATH": f"/home/aimiral/.npm-global/bin:/home/aimiral/.local/bin:{os.environ.get('PATH', '')}",
-            },
+            env=env,
         )
         output = result.stdout.strip()
         if not output and result.stderr.strip():
@@ -515,7 +521,7 @@ async def main():
                     await send_message(client, response, msg_id)
 
                     state["active_task"] = None
-                    state["conversation"].append({"role": "user", "text": text})
+                    state.setdefault("conversation", []).append({"role": "user", "text": text})
                     state["conversation"].append({"role": "assistant", "text": response[:500]})
                     save_state(state)
 

@@ -198,7 +198,7 @@ def run_claude(message: str, state: dict, project: str | None = None, continue_s
 
     # セッションID管理（プロジェクトごとに会話継続）
     session_key = project or "_default"
-    cmd = [CLAUDE_PATH, "-p"]
+    cmd = [CLAUDE_PATH, "-p", "--dangerously-skip-permissions"]
 
     if continue_session and session_key in state.get("session_ids", {}):
         # 前回のセッションを継続

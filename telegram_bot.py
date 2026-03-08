@@ -225,7 +225,7 @@ def run_claude(message: str, state: dict, project: str | None = None, continue_s
             input=prompt,
             capture_output=True,
             text=True,
-            timeout=600,
+            timeout=1800,
             cwd=work_dir,
             env=env,
         )

@@ -360,11 +360,15 @@ async def main():
                         issue = item["issue"]
                         issue_key = item["key"]
 
+                        # 先にprocessed扱いにする（ループ防止）
+                        state.setdefault("processed_issues", []).append(issue_key)
+                        save_state(state)
+
                         # Telegramに通知
                         await send_message(
                             client,
                             f"🔍 Issue発見！自動作業開始するで\n\n"
-                            f"プロジェクト: {project}\n"
+                            f"プロジェクト: {project or 'AiMiraiLabs'}\n"
                             f"#{issue['number']}: {issue['title']}\n"
                             f"{issue.get('body', '')[:300]}"
                         )
@@ -393,8 +397,6 @@ async def main():
                             f"📋 Issue #{issue['number']} 作業完了\n\n{response}"
                         )
 
-                        # 処理済みに追加
-                        state["processed_issues"].append(issue_key)
                         state["active_task"] = None
                         save_state(state)
 

@@ -23,6 +23,7 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5458366490")
 STATE_FILE = Path.home() / ".claude" / "telegram-bot-state.json"
 APPROVAL_DIR = Path.home() / ".claude" / "approvals"
 CLAUDE_PATH = "/home/aimiral/.npm-global/bin/claude"
+CREDENTIALS_FILE = Path.home() / ".secrets" / "credentials.env"
 
 MAX_MSG_LEN = 4000
 
@@ -496,6 +497,32 @@ async def main():
                         status_emoji = "✅ 承認" if approved else "❌ 却下"
                         count = len(pending)
                         await send_message(client, f"{status_emoji} {count}件の承認を処理したで！", msg_id)
+                        continue
+
+                    # ----- 秘密保存コマンド（ログに出さない） -----
+                    if text.startswith("/secret "):
+                        # 形式: /secret KEY_NAME=value
+                        secret_data = text[8:].strip()
+                        if "=" in secret_data:
+                            try:
+                                CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
+                                with open(CREDENTIALS_FILE, "a") as f:
+                                    f.write(f"\n{secret_data}")
+                                key_name = secret_data.split("=")[0]
+                                await send_message(client, f"🔐 {key_name} を安全に保存したで！", msg_id)
+                                # Telegramのメッセージを削除（key露出防止）
+                                try:
+                                    await client.post(
+                                        f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage",
+                                        json={"chat_id": CHAT_ID, "message_id": msg_id},
+                                        timeout=10,
+                                    )
+                                except Exception:
+                                    await send_message(client, "⚠️ 元メッセージの削除に失敗。手動で消してな！")
+                            except Exception as e:
+                                await send_message(client, f"保存エラー: {e}", msg_id)
+                        else:
+                            await send_message(client, "形式: /secret KEY_NAME=value", msg_id)
                         continue
 
                     # ----- コマンド処理 -----
